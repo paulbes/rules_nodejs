@@ -14,15 +14,15 @@
 
 """Executing programs
 
-These rules run the node binary with the given sources.
+These rules run the node executable with the given sources.
 
 They support module mapping: any targets in the transitive dependencies with
 a `module_name` attribute can be `require`d by that name.
 """
 
-load("//internal/common:expand_into_runfiles.bzl", "expand_location_into_runfiles")
+load("@build_bazel_rules_nodejs//internal/common:node_module_info.bzl", "NodeModuleSources", "collect_node_modules_aspect")
+load("//internal/common:expand_into_runfiles.bzl", "expand_location_into_runfiles", "expand_path_into_runfiles")
 load("//internal/common:module_mappings.bzl", "module_mappings_runtime_aspect")
-load("//internal/common:node_module_info.bzl", "NodeModuleInfo", "collect_node_modules_aspect")
 load("//internal/common:sources_aspect.bzl", "sources_aspect")
 
 def _trim_package_node_modules(package_name):
@@ -36,30 +36,30 @@ def _trim_package_node_modules(package_name):
         segments += [n]
     return "/".join(segments)
 
-def _write_loader_script(ctx):
-    # Generates the JavaScript snippet of module roots mappings, with each entry
-    # in the form:
-    #   {module_name: /^mod_name\b/, module_root: 'path/to/mod_name'}
-    module_mappings = []
-    for d in ctx.attr.data:
-        if hasattr(d, "runfiles_module_mappings"):
-            for [mn, mr] in d.runfiles_module_mappings.items():
-                escaped = mn.replace("/", "\/").replace(".", "\.")
-                mapping = "{module_name: /^%s\\b/, module_root: '%s'}" % (escaped, mr)
-                module_mappings.append(mapping)
+def _compute_node_modules_root(ctx):
+    """Computes the node_modules root from the node_modules and deps attributes.
 
+    Args:
+      ctx: the skylark execution context
+
+    Returns:
+      The node_modules root as a string
+    """
     node_modules_root = None
-    if ctx.files.node_modules:
-        # ctx.files.node_modules is not an empty list
-        workspace = ctx.attr.node_modules.label.workspace_root.split("/")[1] if ctx.attr.node_modules.label.workspace_root else ctx.workspace_name
-        node_modules_root = "/".join([f for f in [
-            workspace,
-            _trim_package_node_modules(ctx.attr.node_modules.label.package),
-            "node_modules",
-        ] if f])
+    if ctx.attr.node_modules:
+        if NodeModuleSources in ctx.attr.node_modules:
+            node_modules_root = "/".join([ctx.attr.node_modules[NodeModuleSources].workspace, "node_modules"])
+        elif ctx.files.node_modules:
+            # ctx.files.node_modules is not an empty list
+            workspace = ctx.attr.node_modules.label.workspace_root.split("/")[1] if ctx.attr.node_modules.label.workspace_root else ctx.workspace_name
+            node_modules_root = "/".join([f for f in [
+                workspace,
+                _trim_package_node_modules(ctx.attr.node_modules.label.package),
+                "node_modules",
+            ] if f])
     for d in ctx.attr.data:
-        if NodeModuleInfo in d:
-            possible_root = "/".join([d[NodeModuleInfo].workspace, "node_modules"])
+        if NodeModuleSources in d:
+            possible_root = "/".join([d[NodeModuleSources].workspace, "node_modules"])
             if not node_modules_root:
                 node_modules_root = possible_root
             elif node_modules_root != possible_root:
@@ -73,6 +73,31 @@ def _write_loader_script(ctx):
             ctx.attr.node_modules.label.package,
             "node_modules",
         ] if f])
+    return node_modules_root
+
+def _write_loader_script(ctx):
+    # Generates the JavaScript snippet of module roots mappings, with each entry
+    # in the form:
+    #   {module_name: /^mod_name\b/, module_root: 'path/to/mod_name'}
+    module_mappings = []
+    for d in ctx.attr.data:
+        if hasattr(d, "runfiles_module_mappings"):
+            for [mn, mr] in d.runfiles_module_mappings.items():
+                escaped = mn.replace("/", "\/").replace(".", "\.")
+                mapping = "{module_name: /^%s\\b/, module_root: '%s'}" % (escaped, mr)
+                module_mappings.append(mapping)
+
+    node_modules_root = _compute_node_modules_root(ctx)
+
+    if len(ctx.attr.entry_point.files.to_list()) != 1:
+        fail("labels in entry_point must contain exactly one file")
+
+    entry_point_path = expand_path_into_runfiles(ctx, ctx.file.entry_point.short_path)
+
+    # If the entry point specified is a typescript file then set the entry
+    # point to the corresponding .js file
+    if entry_point_path.endswith(".ts"):
+        entry_point_path = entry_point_path[:-3] + ".js"
 
     ctx.actions.expand_template(
         template = ctx.file._loader_template,
@@ -82,7 +107,7 @@ def _write_loader_script(ctx):
             "TEMPLATED_bootstrap": "\n  " + ",\n  ".join(
                 ["\"" + d + "\"" for d in ctx.attr.bootstrap],
             ),
-            "TEMPLATED_entry_point": ctx.attr.entry_point,
+            "TEMPLATED_entry_point": entry_point_path,
             "TEMPLATED_gen_dir": ctx.genfiles_dir.path,
             "TEMPLATED_install_source_map_support": str(ctx.attr.install_source_map_support).lower(),
             "TEMPLATED_module_roots": "\n  " + ",\n  ".join(module_mappings),
@@ -100,8 +125,13 @@ def _short_path_to_manifest_path(ctx, short_path):
         return ctx.workspace_name + "/" + short_path
 
 def _nodejs_binary_impl(ctx):
-    node = ctx.file.node
-    node_modules = ctx.files.node_modules
+    node_modules = depset(ctx.files.node_modules)
+
+    # Also include files from npm fine grained deps as inputs.
+    # These deps are identified by the NodeModuleSources provider.
+    for d in ctx.attr.data:
+        if NodeModuleSources in d:
+            node_modules = depset(transitive = [node_modules, d[NodeModuleSources].sources])
 
     # Using a depset will allow us to avoid flattening files and sources
     # inside this loop. This should reduce the performances hits,
@@ -133,40 +163,56 @@ def _nodejs_binary_impl(ctx):
     if hasattr(ctx.attr, "expected_exit_code"):
         expected_exit_code = ctx.attr.expected_exit_code
 
-    substitutions = {
-        "TEMPLATED_args": " ".join([
-            expand_location_into_runfiles(ctx, a)
-            for a in ctx.attr.templated_args
-        ]),
-        "TEMPLATED_env_vars": env_vars,
-        "TEMPLATED_expected_exit_code": str(expected_exit_code),
-        "TEMPLATED_node": _short_path_to_manifest_path(ctx, node.short_path),
-        "TEMPLATED_repository_args": _short_path_to_manifest_path(ctx, ctx.file._repository_args.short_path),
-        "TEMPLATED_script_path": script_path,
-    }
-    ctx.actions.expand_template(
-        template = ctx.file._launcher_template,
-        output = ctx.outputs.script,
-        substitutions = substitutions,
-        is_executable = True,
-    )
+    node_tool_info = ctx.toolchains["@build_bazel_rules_nodejs//toolchains/node:toolchain_type"].nodeinfo
+    node_tool_files = []
+    if node_tool_info.target_tool_path == "" and not node_tool_info.target_tool:
+        # If tool_path is empty and tool_target is None then there is no local
+        # node tool, we will just print a nice error message if the user
+        # attempts to do bazel run
+        fail("The node toolchain was not properly configured so %s cannot be executed. Make sure that target_tool_path or target_tool is set." % ctx.attr.name)
+    else:
+        node_tool = node_tool_info.target_tool_path
+        if node_tool_info.target_tool:
+            node_tool_files += node_tool_info.target_tool.files.to_list()
+            node_tool = _short_path_to_manifest_path(ctx, node_tool_files[0].short_path)
 
-    runfiles = depset([node, ctx.outputs.loader, ctx.file._repository_args] + node_modules + ctx.files._node_runfiles, transitive = [sources])
+        substitutions = {
+            "TEMPLATED_args": " ".join([
+                expand_location_into_runfiles(ctx, a)
+                for a in ctx.attr.templated_args
+            ]),
+            "TEMPLATED_env_vars": env_vars,
+            "TEMPLATED_expected_exit_code": str(expected_exit_code),
+            "TEMPLATED_node": node_tool,
+            "TEMPLATED_repository_args": _short_path_to_manifest_path(ctx, ctx.file._repository_args.short_path),
+            "TEMPLATED_script_path": script_path,
+        }
+        ctx.actions.expand_template(
+            template = ctx.file._launcher_template,
+            output = ctx.outputs.script,
+            substitutions = substitutions,
+            is_executable = True,
+        )
+
+    runfiles = depset(node_tool_files + [ctx.outputs.loader, ctx.file._repository_args], transitive = [sources, node_modules])
+
+    # entry point is only needed in runfiles if it is a .js file
+    if ctx.file.entry_point.extension == "js":
+        runfiles = depset([ctx.file.entry_point], transitive = [runfiles])
 
     return [DefaultInfo(
         executable = ctx.outputs.script,
         runfiles = ctx.runfiles(
             transitive_files = runfiles,
-            files = [
-                        node,
+            files = node_tool_files + [
                         ctx.outputs.loader,
-                    ] + ctx.files._source_map_support_files + node_modules +
+                    ] + ctx.files._source_map_support_files +
 
                     # We need this call to the list of Files.
                     # Calling the .to_list() method may have some perfs hits,
                     # so we should be running this method only once per rule.
                     # see: https://docs.bazel.build/versions/master/skylark/depsets.html#performance
-                    sources.to_list(),
+                    node_modules.to_list() + sources.to_list(),
             collect_data = True,
         ),
     )]
@@ -191,23 +237,71 @@ _NODEJS_EXECUTABLE_ATTRS = {
         allow_files = True,
         aspects = [sources_aspect, module_mappings_runtime_aspect, collect_node_modules_aspect],
     ),
-    "entry_point": attr.string(
+    "entry_point": attr.label(
         doc = """The script which should be executed first, usually containing a main function.
-        This attribute expects a string starting with the workspace name, so that it's not ambiguous
-        in cases where a script with the same name appears in another directory or external workspace.
+
+        If the entry JavaScript file belongs to the same package (as the BUILD file), 
+        you can simply reference it by its relative name to the package directory:
+
+        ```
+        nodejs_binary(
+            name = "my_binary",
+            ...
+            entry_point = ":file.js",
+        )
+        ```
+
+        You can specify the entry point as a typescript file so long as you also include
+        the ts_library target in data:
+
+        ```
+        ts_library(
+            name = "main",
+            srcs = ["main.ts"],
+        )
+
+        nodejs_binary(
+            name = "bin",
+            data = [":main"]
+            entry_point = ":main.ts",
+        )
+        ```
+
+        The rule will use the corresponding `.js` output of the ts_library rule as the entry point.
+
+        If the entry point target is a rule, it should produce a single JavaScript entry file that will be passed to the nodejs_binary rule. 
+        For example:
+
+        ```
+        filegroup(
+            name = "entry_file",
+            srcs = ["main.js"],
+        )
+
+        nodejs_binary(
+            name = "my_binary",
+            entry_point = ":entry_file",
+        )
+        ```
+
+        The entry_point can also be a label in another workspace:
+
+        ```
+        nodejs_binary(
+            name = "history-server",
+            entry_point = "@npm//:node_modules/history-server/modules/cli.js",
+            data = ["@npm//history-server"],
+        )
+        ```
         """,
         mandatory = True,
+        allow_single_file = True,
     ),
     "install_source_map_support": attr.bool(
         doc = """Install the source-map-support package.
         Enable this to get stack traces that point to original sources, e.g. if the program was written
         in TypeScript.""",
         default = True,
-    ),
-    "node": attr.label(
-        doc = """The node entry point target.""",
-        default = Label("@nodejs//:node"),
-        allow_single_file = True,
     ),
     "node_modules": attr.label(
         doc = """The npm packages which should be available to `require()` during
@@ -290,12 +384,8 @@ _NODEJS_EXECUTABLE_ATTRS = {
         default = Label("//internal/node:node_loader.js"),
         allow_single_file = True,
     ),
-    "_node_runfiles": attr.label(
-        default = Label("@nodejs//:node_runfiles"),
-        allow_files = True,
-    ),
     "_repository_args": attr.label(
-        default = Label("@nodejs//:bin/node_args.sh"),
+        default = Label("@nodejs//:bin/node_repo_args.sh"),
         allow_single_file = True,
     ),
     "_source_map_support_files": attr.label_list(
@@ -322,6 +412,7 @@ nodejs_binary = rule(
     attrs = _NODEJS_EXECUTABLE_ATTRS,
     executable = True,
     outputs = _NODEJS_EXECUTABLE_OUTPUTS,
+    toolchains = ["@build_bazel_rules_nodejs//toolchains/node:toolchain_type"],
 )
 """Runs some JavaScript code in NodeJS.
 """
@@ -336,6 +427,7 @@ nodejs_test = rule(
     }),
     test = True,
     outputs = _NODEJS_EXECUTABLE_OUTPUTS,
+    toolchains = ["@build_bazel_rules_nodejs//toolchains/node:toolchain_type"],
 )
 """
 Identical to `nodejs_binary`, except this can be used with `bazel test` as well.
@@ -360,6 +452,16 @@ Now you can add `--config=debug` to any `bazel test` command line.
 The runtime will pause before executing the program, allowing you to connect a
 remote debugger.
 """
+# Adding the above nodejs_test & nodejs_binary docstrings as `doc` attributes
+# causes a build error but ONLY on Ubuntu 14.04 on BazelCI.
+# ```
+# File "internal/node/node.bzl", line 378, in <module>
+#     outputs = _NODEJS_EXECUTABLE_OUTPUTS,
+# TypeError: rule() got an unexpected keyword argument 'doc'
+# ```
+# This error does not occur on any other platform on BazelCI including Ubuntu 16.04.
+# TOOD(gregmagolan): Figure out why and/or file a bug to Bazel
+# See https://github.com/bazelbuild/buildtools/issues/471#issuecomment-485283200
 
 def nodejs_binary_macro(name, data = [], args = [], visibility = None, tags = [], testonly = 0, **kwargs):
     """This macro exists only to wrap the nodejs_binary as an .exe for Windows.

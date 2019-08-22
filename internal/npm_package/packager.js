@@ -18,6 +18,10 @@ const fs = require('fs');
 const path = require('path');
 const isBinary = require('isbinaryfile').isBinaryFileSync;
 
+/**
+ * Create a new directory and any necessary subdirectories
+ * if they do not exist.
+ */
 function mkdirp(p) {
   if (!fs.existsSync(p)) {
     mkdirp(path.dirname(p));
@@ -25,7 +29,7 @@ function mkdirp(p) {
   }
 }
 
-function copyWithReplace(src, dest, replacements) {
+function copyWithReplace(src, dest, replacements, renameBuildFiles) {
   mkdirp(path.dirname(dest));
   if (!isBinary(src)) {
     let content = fs.readFileSync(src, {encoding: 'utf-8'});
@@ -33,6 +37,15 @@ function copyWithReplace(src, dest, replacements) {
       const [regexp, newvalue] = r;
       content = content.replace(regexp, newvalue);
     });
+    if (renameBuildFiles) {
+      // Prefix all Bazel BUILD files with _ for npm packages.
+      // npm packages should not publish build files as this
+      // breaks their usage within yarn_install & npm_install rules.
+      const basenameUc = path.basename(dest).toUpperCase();
+      if (basenameUc == 'BUILD' || basenameUc == 'BUILD.BAZEL') {
+        dest = path.posix.join(path.dirname(dest), `_${path.basename(dest)}`);
+      }
+    }
     fs.writeFileSync(dest, content);
   } else {
     fs.copyFileSync(src, dest);
@@ -47,7 +60,9 @@ function main(args) {
   args = fs.readFileSync(args[0], {encoding: 'utf-8'}).split('\n').map(unquoteArgs);
   const
       [outDir, baseDir, srcsArg, binDir, genDir, depsArg, packagesArg, replacementsArg, packPath,
-       publishPath, replaceWithVersion, stampFile, vendorExternalArg] = args;
+       publishPath, replaceWithVersion, stampFile, vendorExternalArg, renameBuildFilesArg,
+       runNpmTemplatePath] = args;
+  const renameBuildFiles = parseInt(renameBuildFilesArg);
 
   const replacements = [
     // Strip content between BEGIN-INTERNAL / END-INTERNAL comments
@@ -81,41 +96,51 @@ function main(args) {
   }
 
   // src like baseDir/my/path is just copied to outDir/my/path
-  for (src of srcsArg.split(',').filter(s => !!s)) {
-    copyWithReplace(src, path.join(outDir, path.relative(baseDir, src)), replacements);
+  for (let src of srcsArg.split(',').filter(s => !!s)) {
+    src = src.replace(/\\/g, '/');
+    if (src.startsWith('external/')) {
+      // If srcs is from external workspace drop the external/wksp portion
+      copyWithReplace(
+          src, path.join(outDir, src.split('/').slice(2).join('/')), replacements,
+          renameBuildFiles);
+    } else {
+      // Source is from local workspace
+      if (baseDir && !src.startsWith(`${baseDir}/`)) {
+        throw new Error(
+            `${src} in 'srcs' does not reside in the base directory, ` +
+            `generated file should belong in 'deps' instead.`);
+      }
+      copyWithReplace(
+          src, path.join(outDir, path.relative(baseDir, src)), replacements, renameBuildFiles);
+    }
   }
 
   function outPath(f) {
-    function findRoot() {
-      for (ext of vendorExternalArg.split(',').filter(s => !!s)) {
-        const candidate = path.join(binDir, 'external', ext);
-        if (!path.relative(candidate, f).startsWith('..')) {
-          return candidate;
-        }
-      }
-      if (!path.relative(binDir, f).startsWith('..')) {
-        return binDir;
-      } else if (!path.relative(genDir, f).startsWith('..')) {
-        return genDir;
-      } else {
-        // It might be nice to enforce here that deps don't contain sources
-        // since those belong in srcs above.
-        // The `deps` attribute should typically be outputs of other rules.
-        // However, things like .d.ts sources of a ts_library or data attributes
-        // of ts_library will result in source files that appear in the deps
-        // so we have to allow this.
-        return '.';
+    for (ext of vendorExternalArg.split(',').filter(s => !!s)) {
+      const candidate = path.join(binDir, 'external', ext);
+      if (!path.relative(candidate, f).startsWith('..')) {
+        return path.join(outDir, path.relative(candidate, f));
       }
     }
-    return path.join(outDir, path.relative(path.join(findRoot(), baseDir), f));
+    if (!path.relative(binDir, f).startsWith('..')) {
+      return path.join(outDir, path.relative(path.join(binDir, baseDir), f));
+    } else if (!path.relative(genDir, f).startsWith('..')) {
+      return path.join(outDir, path.relative(path.join(genDir, baseDir), f));
+    } else {
+      // It might be nice to enforce here that deps don't contain sources
+      // since those belong in srcs above.
+      // The `deps` attribute should typically be outputs of other rules.
+      // However, things like .d.ts sources of a ts_library or data attributes
+      // of ts_library will result in source files that appear in the deps
+      // so we have to allow this.
+      return path.join(outDir, path.relative(baseDir, f));
+    }
   }
 
-  // deps like bazel-bin/baseDir/my/path is copied to outDir/my/path
-  // Don't include external directories in the package, these should be installed
-  // by users outside of the package.
-  for (dep of depsArg.split(',').filter(s => !!s && !s.startsWith('external/'))) {
+  // Deps like bazel-bin/baseDir/my/path is copied to outDir/my/path.
+  for (dep of depsArg.split(',').filter(s => !!s)) {
     try {
-      copyWithReplace(dep, outPath(dep), replacements);
+      copyWithReplace(dep, outPath(dep), replacements, renameBuildFiles);
     } catch (e) {
       console.error(`Failed to copy ${dep} to ${outPath(dep)}`);
       throw e;
@@ -127,6 +152,7 @@ function main(args) {
   for (pkg of packagesArg.split(',').filter(s => !!s)) {
     const outDir = outPath(path.dirname(pkg));
     function copyRecursive(base, file) {
+      file = file.replace(/\\/g, '/');
       if (fs.lstatSync(path.join(base, file)).isDirectory()) {
         const files = fs.readdirSync(path.join(base, file));
         files.forEach(f => {
@@ -141,7 +167,8 @@ function main(args) {
           }
           return file;
         }
-        copyWithReplace(path.join(base, file), path.join(outDir, outFile()), replacements);
+        copyWithReplace(
+            path.join(base, file), path.join(outDir, outFile()), replacements, renameBuildFiles);
       }
     }
     fs.readdirSync(pkg).forEach(f => {
@@ -149,8 +176,7 @@ function main(args) {
     });
   }
 
-  const npmTemplate =
-      fs.readFileSync(require.resolve('nodejs/run_npm.sh.template'), {encoding: 'utf-8'});
+  const npmTemplate = fs.readFileSync(require.resolve(runNpmTemplatePath), {encoding: 'utf-8'});
   // Resolve the outDir to an absolute path so it doesn't depend on Bazel's bazel-out symlink
   fs.writeFileSync(packPath, npmTemplate.replace('TMPL_args', `pack "${path.resolve(outDir)}"`));
   fs.writeFileSync(publishPath, npmTemplate.replace('TMPL_args', `publish "${path.resolve(outDir)}"`));

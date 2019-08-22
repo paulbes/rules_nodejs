@@ -11,6 +11,31 @@ jasmine_node_test(
     bootstrap = ["e2e_jasmine/jasmine_shared_env_bootstrap.js"],
     data = ["jasmine_shared_env_bootstrap.js"],
     deps = [
+        "@npm//jasmine",
+        "@npm//jasmine-core",
         "@npm//zone.js",
     ],
+)
+
+jasmine_node_test(
+    name = "coverage_test",
+    srcs = [
+        "coverage.spec.js",
+        "coverage_source.js",
+    ],
+    coverage = True,
+)
+
+# For testing from the root workspace of this repository with bazel_integration_test.
+filegroup(
+    name = "all_files",
+    srcs = glob(
+        include = ["**/*"],
+        exclude = [
+            "bazel-out/**/*",
+            "dist/**/*",
+            "node_modules/**/*",
+        ],
+    ),
+    visibility = ["//visibility:public"],
 )

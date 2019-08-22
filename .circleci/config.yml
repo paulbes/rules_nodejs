@@ -9,9 +9,8 @@
 
 ## IMPORTANT
 # If you change the `default_docker_image` version, also change the `cache_key` version
-var_1: &default_docker_image circleci/node:10.12
-var_2: &browsers_docker_image circleci/node:10.12-browsers
-var_3: &cache_key node-0.12-{{ checksum "yarn.lock" }}-{{ checksum "examples/program/yarn.lock" }}-{{ checksum "internal/npm_install/test/package/yarn.lock" }}
+var_1: &default_docker_image circleci/node:10.16
+var_3: &cache_key node-0.16-{{ checksum "yarn.lock" }}
 
 var_4: &init_environment
   run:
@@ -19,6 +18,17 @@ var_4: &init_environment
     command: |
       # Setup circleci environment
       ./.circleci/env.sh
+
+      sudo apt-get update
+      # Install GTK+ graphical user interface (libgtk-3-0), advanced linux sound architecture (libasound2)
+      # and network security service libraries (libnss3) & X11 Screen Saver extension library (libssx1)
+      # which are dependendies of chrome & needed for karma & protractor headless chrome tests.
+      # This is a very small install with the whole init_environment step taking less than 8 seconds.
+      # TODO(gregmagolan): switch rules_webtesting to use a chrome headless_shell binary which does
+      #                    not depend on any dynamically linked libs
+      sudo apt-get -y install libgtk-3-0 libasound2 libnss3 libxss1
+      # Also install libraries required for firefox
+      sudo apt-get -y install libdbus-glib-1-2
 
       # Overwrite the yarn installed in the docker container with our own version.
       pathToYarn=$(realpath ./third_party/github.com/yarnpkg/yarn/releases/download/v1.13.0/bin/yarn.js)
@@ -65,8 +75,8 @@ var_8: &use_legacy_runfiles
   run:
     name: Use legacy runfiles
     command: |
-      sed -i -e 's/run --nolegacy_external_runfiles//' .bazelrc
-      sed -i -e 's/test --nolegacy_external_runfiles//' .bazelrc
+      echo 'run --legacy_external_runfiles' >> .bazelrc
+      echo 'test --legacy_external_runfiles' >> .bazelrc
 
 var_9: &job_defaults
   working_directory: ~/rules_nodejs
@@ -97,15 +107,13 @@ jobs:
       - *init_bazel
 
       # Run yarn on all node_repositories
-      - run: bazel run @nodejs//:yarn
+      - run: bazel run @nodejs//:bin/yarn
 
       # Save all node_modules to the cache
       - save_cache:
           key: *cache_key
           paths:
             - "node_modules"
-            - "examples/program/node_modules"
-            - "internal/npm_install/test/package/node_modules"
 
       # Persist any changes at this point to be reused by further jobs.
       - persist_to_workspace:
@@ -123,12 +131,12 @@ jobs:
       - *init_bazel
 
       # Run the Buildifier to check our Bazel rules for format issues.
-      - run: 'yarn bazel:format --mode=check ||
+      - run: 'yarn bazel:format-check ||
               (echo "BUILD files not formatted. Please run ''yarn bazel:format --mode=fix''" ; exit 1)'
 
       # Run the Buildifier to check our Bazel rules for lint issues.
       # Note: The `--lint=warn` will auto fixe (re-write) the affected files. 
-      - run: 'yarn bazel:format --lint=warn ||
+      - run: 'yarn bazel:lint ||
               (echo "BUILD files contain unresolved lint errors. Please fix manually the remaining errors." ; exit 1)'
 
   # Overlaps with testing we do on BuildKite. This is still here because:
@@ -144,8 +152,104 @@ jobs:
       - *init_bazel
       - *hide_node_and_yarn_local_binaries
 
-      - run: bazel build ...
-      - run: bazel test ...
+      - run: bazel test ... --test_tag_filters=-e2e,-examples
+
+      - store_artifacts:
+          path: dist/bin/release.tar.gz
+          destination: release.tar.gz
+
+  test_e2e:
+    <<: *job_defaults
+    resource_class: xlarge
+    # We need to reduce the memory & CPU usage of the top-level
+    # bazel process for this large bazel-in-bazel test to not
+    # deplete the system memory completely.
+    # - startup JVM memory reduced
+    # - top-level bazel process should use as little memory as possible and only 1 core
+    # - nested bazel process should have its memory & core optimally capped as well
+    steps:
+      - *attach_workspace
+      - *init_environment
+      - run:
+          name: Tune top-level bazel JVM memory usage
+          command: echo 'startup --host_jvm_args=-Xms256m --host_jvm_args=-Xmx1280m' >> .bazelrc
+      - *init_bazel
+
+      # Additional e2e assertions that can only be done with `yarn test`
+      - run: cd e2e/symlinked_node_modules_npm && yarn test && bazel clean
+      - run: cd e2e/symlinked_node_modules_yarn && yarn test && bazel clean
+      - run: cd e2e/ts_auto_deps && yarn test && bazel clean
+
+      - *hide_node_and_yarn_local_binaries
+
+      # Split up the build & test as test takes a long time and has very
+      # little output so running build first makes CI output friendlier.
+      # The build step can also use up more memory which may be required
+      # to build the release package with this configuration.
+      - run: bazel build --build_tag_filters=e2e ...
+      - run:
+          command: bazel test --test_tag_filters=e2e --local_resources=792,1.0,1.0 --test_arg=--local_resources=13288,7.0,1.0 --test_arg=--test_tag_filters=-no-circleci ...
+          no_output_timeout: 20m
+
+  test_examples:
+    <<: *job_defaults
+    resource_class: xlarge
+    # We need to reduce the memory & CPU usage of the top-level
+    # bazel process for this large bazel-in-bazel test to not
+    # deplete the system memory completely.
+    # - startup JVM memory reduced
+    # - top-level bazel process should use as little memory as possible and only 1 core
+    # - nested bazel process should have its memory & core optimally capped as well
+    steps:
+      - *attach_workspace
+      - *init_environment
+      - run:
+          name: Tune top-level bazel JVM memory usage
+          command: echo 'startup --host_jvm_args=-Xms256m --host_jvm_args=-Xmx1280m' >> .bazelrc
+      - *init_bazel
+      - *hide_node_and_yarn_local_binaries
+
+      # Split up the build & test as test takes a long time and has very
+      # little output so running build first makes CI output friendlier.
+      # The build step can also use up more memory which may be required
+      # to build the release package with this configuration.
+      - run: bazel build --build_tag_filters=examples ...
+      - run:
+          command: bazel test --test_tag_filters=examples --local_resources=792,1.0,1.0 --test_arg=--local_resources=13288,7.0,1.0 --test_arg=--test_tag_filters=-no-circleci ...
+          no_output_timeout: 20m
+      # The following examples only works on linux as it downloads the linux node distribution
+      # It is tagged "manual" so we run it explicitly here
+      # TODO(gregmagolan): make node_repositories acccept different archives for different platforms
+      - run:
+          command: bazel test --local_resources=792,1.0,1.0 --test_arg=--local_resources=13288,7.0,1.0 //examples:examples_vendored_node //examples:examples_vendored_node_and_yarn
+          no_output_timeout: 20m
+
+  test_e2e_angular_bazel_example:
+    <<: *job_defaults
+    resource_class: xlarge
+    # We need to reduce the memory & CPU usage of the top-level
+    # bazel process for this large bazel-in-bazel test to not
+    # deplete the system memory completely.
+    # - startup JVM memory reduced
+    # - top-level bazel process should use as little memory as possible and only 1 core
+    # - nested bazel process should have its memory & core optimally capped as well
+    steps:
+      - *attach_workspace
+      - *init_environment
+      - run:
+          name: Tune top-level bazel JVM memory usage
+          command: echo 'startup --host_jvm_args=-Xms256m --host_jvm_args=-Xmx1280m' >> .bazelrc
+      - *init_bazel
+      - *hide_node_and_yarn_local_binaries
+
+      # Split up the build & test as test takes a long time and has very
+      # little output so running build first makes CI output friendlier.
+      # The build step can also use up more memory which may be required
+      # to build the release package with this configuration.
+      - run: bazel build //e2e:e2e_angular_bazel_example
+      - run:
+          command: bazel test --local_resources=792,1.0,1.0 --test_arg=--local_resources=13288,7.0,1.0 --test_arg=--test_tag_filters=-no-circleci //e2e:e2e_angular_bazel_example
+          no_output_timeout: 20m
 
   runnable_targets:
     <<: *job_defaults
@@ -160,8 +264,13 @@ jobs:
       - run: bazel run //internal/node/test:has_deps_legacy
       - run: bazel run //internal/node/test:has_deps
       - run: bazel run //internal/node/test:has_deps_hybrid
+      - run: bazel run //internal/node/test:module_name_test
       - run: bazel run //internal/e2e/fine_grained_no_bin:index
       - run: bazel run @fine_grained_deps_yarn//typescript/bin:tsc
+      - run: bazel run @bazel_workspace_a//:bin
+      - run: bazel run @bazel_workspace_a//subdir:bin
+      - run: bazel run @bazel_workspace_b//:bin
+      - run: bazel run @bazel_workspace_b//subdir:bin
 
   test_legacy_runfiles:
     <<: *job_defaults
@@ -175,130 +284,9 @@ jobs:
       # We should also be able to test targets in a different workspace
       # TODO(gmagolan): move these tests into `build` job once
       # https://github.com/bazelbuild/bazel/issues/6481 is resolved
-      - run: bazel test @examples_program//...
-      - run: bazel test @packages_example//...
-
-  build_release:
-    <<: *job_defaults
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - *hide_node_and_yarn_local_binaries
-      - run: ./scripts/build_release.sh
-      - persist_to_workspace:
-          root: ~/
-          paths:
-            - ./rules_nodejs/dist/build_bazel_rules_nodejs
-
-  build_typescript_package:
-    <<: *job_defaults
-    # Need to compile Go and protocol buffers from source for typescript package
-    resource_class: xlarge
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - *hide_node_and_yarn_local_binaries
-      - run: ./scripts/build_packages.sh typescript
-      - persist_to_workspace:
-          root: ~/
-          paths:
-            - ./rules_nodejs/dist/npm_bazel_typescript
-
-  build_karma_package:
-    <<: *job_defaults
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - *hide_node_and_yarn_local_binaries
-      - run: ./scripts/build_packages.sh karma
-      - persist_to_workspace:
-          root: ~/
-          paths:
-            - ./rules_nodejs/dist/npm_bazel_karma
-
-  build_jasmine_package:
-    <<: *job_defaults
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - *hide_node_and_yarn_local_binaries
-      - run: ./scripts/build_packages.sh jasmine
-      - persist_to_workspace:
-          root: ~/
-          paths:
-            - ./rules_nodejs/dist/npm_bazel_jasmine
-
-  build_labs_package:
-    <<: *job_defaults
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - *hide_node_and_yarn_local_binaries
-      - run: ./scripts/build_packages.sh labs
-      - persist_to_workspace:
-          root: ~/
-          paths:
-            - ./rules_nodejs/dist/npm_bazel_labs
-
-  test_packages:
-    <<: *job_defaults
-    # Need to compile Go and protocol buffers from source for typescript package
-    resource_class: xlarge
-    parallelism: 4
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - run: ./scripts/test_packages_all.sh ${CIRCLE_NODE_INDEX} ${CIRCLE_NODE_TOTAL}
-
-  # This job cannot run on BuildKite (BazelCI) because it requires changing
-  # directories to test inside nested workspaces.
-  # See https://github.com/bazelbuild/continuous-integration/issues/225
-  test_e2e:
-    <<: *job_defaults
-    docker:
-      # Needed because some tests require local chrome
-      - image: *browsers_docker_image
-    resource_class: xlarge
-    parallelism: 4
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      # Some e2e tests such as ts_devserver require xvfb
-      - run: xvfb-run -a ./scripts/test_e2e_all.sh ${CIRCLE_NODE_INDEX} ${CIRCLE_NODE_TOTAL}
-
-  # These e2e tests are in the process of being moved to the test_e2e job
-  test_e2e_legacy:
-    <<: *job_defaults
-    parallelism: 2
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      - run: ./scripts/test_legacy_e2e_all.sh ${CIRCLE_NODE_INDEX} ${CIRCLE_NODE_TOTAL}
-
-  # This job cannot run on BuildKite (BazelCI) because it requires changing
-  # directories to test inside nested workspaces.
-  # See https://github.com/bazelbuild/continuous-integration/issues/225
-  test_examples:
-    <<: *job_defaults
-    docker:
-      # Needed because some tests require local chrome
-      - image: *browsers_docker_image
-    resource_class: xlarge
-    parallelism: 4
-    steps:
-      - *attach_workspace
-      - *init_environment
-      - *init_bazel
-      # Some examples such as app require xvfb
-      - run: xvfb-run -a ./scripts/test_examples_all.sh ${CIRCLE_NODE_INDEX} ${CIRCLE_NODE_TOTAL}
+      - run: 'cd examples/user_managed_deps && bazel run @nodejs//:yarn'
+      - run: bazel test @examples_user_managed_deps//...
+      - run: bazel test @e2e_packages//...
 
 workflows:
   version: 2
@@ -311,45 +299,15 @@ workflows:
       - test:
           requires:
           - setup
+      - test_e2e:
+          requires:
+          - setup
+      - test_examples:
+          requires:
+          - setup
+      - test_e2e_angular_bazel_example:
+          requires:
+          - setup
       - runnable_targets:
           requires:
           - setup
-      - test_legacy_runfiles:
-          requires:
-          - setup
-      - build_release:
-          requires:
-          - setup
-      - build_jasmine_package:
-          requires:
-          - setup
-      - build_karma_package:
-          requires:
-          # karma package depends on typescript package
-          - build_typescript_package
-      - build_labs_package:
-          requires:
-          - setup
-      - build_typescript_package:
-          requires:
-          - setup
-      - test_packages:
-          requires:
-          - build_typescript_package
-      - test_e2e:
-          requires:
-          - build_release
-          - build_typescript_package
-          - build_jasmine_package
-          - build_labs_package
-          - build_karma_package
-      - test_e2e_legacy:
-          requires:
-          - build_release
-      - test_examples:
-          requires:
-          - build_release
-          - build_typescript_package
-          - build_jasmine_package
-          - build_labs_package
-          - build_karma_package

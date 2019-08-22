@@ -21,22 +21,72 @@ as the package manager.
 See discussion in the README.
 """
 
-load("//internal/common:os_name.bzl", "os_name")
+load("//internal/common:check_bazel_version.bzl", "check_bazel_version")
+load("//internal/common:os_name.bzl", "is_windows_os")
 load("//internal/node:node_labels.bzl", "get_node_label", "get_npm_label", "get_yarn_label")
 
 COMMON_ATTRIBUTES = dict(dict(), **{
-    "data": attr.label_list(),
+    "always_hide_bazel_files": attr.bool(
+        doc = """If True then Bazel build files such as `BUILD` and BUILD.bazel`
+        will always be hidden by prefixing them with `_`.
+        
+        Defaults to False, in which case Bazel files are _not_ hidden when `symlink_node_modules`
+        is True. In this case, the rule will report an error when there are Bazel files detected
+        in npm packages.
+        
+        Reporting the error is desirable as relying on this repository rule to hide
+        these files does not work in the case where a user deletes their node_modules folder
+        and manually re-creates it with yarn or npm outside of Bazel which would restore them.
+        On a subsequent Bazel build, this repository rule does not re-run and the presence
+        of the Bazel files leads to a build failure that looks like the following:
+
+        ```
+        ERROR: /private/var/tmp/_bazel_greg/37b273501bbecefcf5ce4f3afcd7c47a/external/npm/BUILD.bazel:9:1:
+        Label '@npm//:node_modules/rxjs/src/AsyncSubject.ts' crosses boundary of subpackage '@npm//node_modules/rxjs/src'
+        (perhaps you meant to put the colon here: '@npm//node_modules/rxjs/src:AsyncSubject.ts'?)
+        ```
+
+        See https://github.com/bazelbuild/rules_nodejs/issues/802 for more details.
+        
+        The recommended solution is to use the @bazel/hide-bazel-files utility to hide these files.
+        See https://github.com/bazelbuild/rules_nodejs/blob/master/packages/hide-bazel-files/README.md
+        for installation instructions.
+
+        The alternate solution is to set `always_hide_bazel_files` to True which tell
+        this rule to hide Bazel files even when `symlink_node_modules` is True. This means
+        you won't need to use `@bazel/hide-bazel-files` utility but if you manually recreate
+        your `node_modules` folder via yarn or npm outside of Bazel you may run into the above
+        error.""",
+        default = False,
+    ),
+    "data": attr.label_list(
+        doc = """Data files required by this rule.
+
+        If symlink_node_modules is True, this attribute is ignored since
+        the dependency manager will run in the package.json location.""",
+    ),
+    "dynamic_deps": attr.string_dict(
+        doc = """Declare implicit dependencies between npm packages.
+        
+        In many cases, an npm package doesn't list a dependency on another package, yet still require()s it.
+        One example is plugins, where a tool like rollup can require rollup-plugin-json if the user installed it.
+        Another example is the tsc_wrapped binary in @bazel/typescript which can require tsickle if its installed.
+        Under Bazel, we must declare these dependencies so that they are included as inputs to the program.
+        
+        Note that the pattern used by many packages, which have plugins in the form pkg-plugin-someplugin, are automatically
+        added as implicit dependencies. Thus for example, `rollup` will automatically get `rollup-plugin-json` included in its
+        dependencies without needing to use this attribute.
+        
+        The keys in the dict are npm package names, and the value may be a particular package, or a prefix ending with *.     
+        For example, `dynamic_deps = {"@bazel/typescript": "tsickle", "karma": "my-karma-plugin-*"}`
+   
+        Note, this may sound like "optionalDependencies" but that field in package.json actually means real dependencies
+        which are installed, but failures on installation are ignored.
+       """,
+        default = {"@bazel/typescript": "tsickle"},
+    ),
     "exclude_packages": attr.string_list(
-        doc = """List of packages to exclude from install.
-
-        Use this when you want to install a package during manual yarn or npm
-        install but not install it when Bazel manages dependencies.
-
-        Note: this attribute may be removed in the future if bazel managed npm
-        dependencies are changed to install to the workspace `node_modules` folder
-        instead of `$(bazel info output_base)/external/wksp`.
-        """,
-        default = ["@bazel/bazel"],
+        doc = """DEPRECATED. This attribute is no longer used.""",
     ),
     "included_files": attr.string_list(
         doc = """List of file extensions to be included in the npm package targets.
@@ -79,32 +129,60 @@ COMMON_ATTRIBUTES = dict(dict(), **{
         default = True,
         doc = "If stdout and stderr should be printed to the terminal.",
     ),
+    "symlink_node_modules": attr.bool(
+        doc = """Turn symlinking of node_modules on
+        
+        This requires the use of Bazel 0.26.0 and the experimental
+        managed_directories feature.
+        
+        When true, the package manager will run in the package.json folder
+        and the resulting node_modules folder will be symlinked into the
+        external repository create by this rule.
+        
+        When false, the package manager will run in the external repository
+        created by this rule and any files other than the package.json file and
+        the lock file that are required for it to run should be listed in the
+        data attribute.""",
+        default = True,
+    ),
 })
 
-def _create_build_file(repository_ctx, node, lock_file):
+def _create_build_files(repository_ctx, rule_type, node, lock_file):
+    error_on_build_files = repository_ctx.attr.symlink_node_modules and not repository_ctx.attr.always_hide_bazel_files
+
     repository_ctx.report_progress("Processing node_modules: installing Bazel packages and generating BUILD files")
     if repository_ctx.attr.manual_build_file_contents:
         repository_ctx.file("manual_build_file_contents", repository_ctx.attr.manual_build_file_contents)
-    result = repository_ctx.execute([node, "generate_build_file.js", repository_ctx.attr.name, ",".join(repository_ctx.attr.included_files), str(lock_file)])
+    result = repository_ctx.execute([
+        node,
+        "generate_build_file.js",
+        repository_ctx.attr.name,
+        rule_type,
+        "1" if error_on_build_files else "0",
+        str(lock_file),
+        ",".join(repository_ctx.attr.included_files),
+        str(repository_ctx.attr.dynamic_deps),
+    ])
     if result.return_code:
-        fail("node failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
-
-def _add_package_json(repository_ctx):
-    repository_ctx.symlink(
-        repository_ctx.attr.package_json,
-        repository_ctx.path("_package.json"),
-    )
+        fail("generate_build_file.js failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
 
 def _add_scripts(repository_ctx):
     repository_ctx.template(
-        "process_package_json.js",
-        repository_ctx.path(Label("//internal/npm_install:process_package_json.js")),
+        "pre_process_package_json.js",
+        repository_ctx.path(Label("//internal/npm_install:pre_process_package_json.js")),
         {},
     )
+
     repository_ctx.template(
         "generate_build_file.js",
         repository_ctx.path(Label("//internal/npm_install:generate_build_file.js")),
         {},
+    )
+
+def _add_package_json(repository_ctx):
+    repository_ctx.symlink(
+        repository_ctx.attr.package_json,
+        repository_ctx.path("package.json"),
     )
 
 def _add_data_dependencies(repository_ctx):
@@ -120,10 +198,33 @@ def _add_data_dependencies(repository_ctx):
         # files as npm file:// packages
         repository_ctx.template("/".join(to), f, {})
 
+def _symlink_node_modules(repository_ctx):
+    package_json_dir = repository_ctx.path(repository_ctx.attr.package_json).dirname
+    repository_ctx.symlink(repository_ctx.path(str(package_json_dir) + "/node_modules"), repository_ctx.path("node_modules"))
+
+def _check_min_bazel_version(rule, repository_ctx):
+    if repository_ctx.attr.symlink_node_modules:
+        # When using symlink_node_modules enforce the minimum Bazel version required
+        check_bazel_version(
+            message = """
+        A minimum Bazel version of 0.26.0 is required for the %s @%s repository rule.
+
+        By default, yarn_install and npm_install in build_bazel_rules_nodejs >= 0.30.0
+        depends on the managed directory feature added in Bazel 0.26.0. See
+        https://github.com/bazelbuild/rules_nodejs/wiki#migrating-to-rules_nodejs-030.
+
+        You can opt out of this feature by setting `symlink_node_modules = False`
+        on all of your yarn_install & npm_install rules.
+        """ % (rule, repository_ctx.attr.name),
+            minimum_bazel_version = "0.26.0",
+        )
+
 def _npm_install_impl(repository_ctx):
     """Core implementation of npm_install."""
 
-    is_windows = os_name(repository_ctx).find("windows") != -1
+    _check_min_bazel_version("npm_install", repository_ctx)
+
+    is_windows_host = is_windows_os(repository_ctx)
     node = repository_ctx.path(get_node_label(repository_ctx))
     npm = get_npm_label(repository_ctx)
     npm_args = ["install"]
@@ -131,8 +232,16 @@ def _npm_install_impl(repository_ctx):
     if repository_ctx.attr.prod_only:
         npm_args.append("--production")
 
+    # If symlink_node_modules is true then run the package manager
+    # in the package.json folder; otherwise, run it in the root of
+    # the external repository
+    if repository_ctx.attr.symlink_node_modules:
+        root = repository_ctx.path(repository_ctx.attr.package_json).dirname
+    else:
+        root = repository_ctx.path("")
+
     # The entry points for npm install for osx/linux and windows
-    if not is_windows:
+    if not is_windows_host:
         repository_ctx.file(
             "npm",
             content = """#!/usr/bin/env bash
@@ -140,7 +249,7 @@ def _npm_install_impl(repository_ctx):
 set -e
 (cd "{root}"; "{npm}" {npm_args})
 """.format(
-                root = repository_ctx.path(""),
+                root = root,
                 npm = repository_ctx.path(npm),
                 npm_args = " ".join(npm_args),
             ),
@@ -152,62 +261,56 @@ set -e
             content = """@echo off
 cd "{root}" && "{npm}" {npm_args}
 """.format(
-                root = repository_ctx.path(""),
+                root = root,
                 npm = repository_ctx.path(npm),
                 npm_args = " ".join(npm_args),
             ),
             executable = True,
         )
 
-    if repository_ctx.attr.package_lock_json:
-        if repository_ctx.attr.exclude_packages:
-            # Copy the file over instead of using a symlink since the lock file
-            # will be modified if there are excluded_packages
-            repository_ctx.template(
-                "package-lock.json",
-                repository_ctx.path(repository_ctx.attr.package_lock_json),
-                {},
-            )
-        else:
-            repository_ctx.symlink(
-                repository_ctx.attr.package_lock_json,
-                repository_ctx.path("package-lock.json"),
-            )
+    if not repository_ctx.attr.symlink_node_modules:
+        repository_ctx.symlink(
+            repository_ctx.attr.package_lock_json,
+            repository_ctx.path("package-lock.json"),
+        )
+        _add_package_json(repository_ctx)
+        _add_data_dependencies(repository_ctx)
 
-    _add_package_json(repository_ctx)
-    _add_data_dependencies(repository_ctx)
     _add_scripts(repository_ctx)
 
-    result = repository_ctx.execute([node, "process_package_json.js", ",".join(repository_ctx.attr.exclude_packages)])
+    result = repository_ctx.execute(
+        [node, "pre_process_package_json.js", repository_ctx.path(repository_ctx.attr.package_json), "npm"],
+        quiet = repository_ctx.attr.quiet,
+    )
     if result.return_code:
-        fail("node failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
+        fail("pre_process_package_json.js failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
 
     repository_ctx.report_progress("Running npm install on %s" % repository_ctx.attr.package_json)
     result = repository_ctx.execute(
-        [repository_ctx.path("npm.cmd" if is_windows else "npm")],
+        [repository_ctx.path("npm.cmd" if is_windows_host else "npm")],
         timeout = repository_ctx.attr.timeout,
         quiet = repository_ctx.attr.quiet,
     )
 
-    if not repository_ctx.attr.package_lock_json:
-        print("\n***********WARNING***********\n%s: npm_install will require a package_lock_json attribute in future versions\n*****************************" % repository_ctx.name)
-
     if result.return_code:
         fail("npm_install failed: %s (%s)" % (result.stdout, result.stderr))
 
-    remove_npm_absolute_paths = Label("@build_bazel_rules_nodejs_npm_install_deps//:node_modules/removeNPMAbsolutePaths/bin/removeNPMAbsolutePaths")
+    remove_npm_absolute_paths = Label("//third_party/github.com/juanjoDiaz/removeNPMAbsolutePaths:bin/removeNPMAbsolutePaths")
 
     # removeNPMAbsolutePaths is run on node_modules after npm install as the package.json files
     # generated by npm are non-deterministic. They contain absolute install paths and other private
     # information fields starting with "_". removeNPMAbsolutePaths removes all fields starting with "_".
     result = repository_ctx.execute(
-        [node, repository_ctx.path(remove_npm_absolute_paths), repository_ctx.path("")],
+        [node, repository_ctx.path(remove_npm_absolute_paths), "/".join([str(root), "node_modules"])],
     )
 
     if result.return_code:
         fail("remove_npm_absolute_paths failed: %s (%s)" % (result.stdout, result.stderr))
 
-    _create_build_file(repository_ctx, node, repository_ctx.attr.package_lock_json)
+    if repository_ctx.attr.symlink_node_modules:
+        _symlink_node_modules(repository_ctx)
+
+    _create_build_files(repository_ctx, "npm_install", node, repository_ctx.attr.package_lock_json)
 
 npm_install = repository_rule(
     attrs = dict(COMMON_ATTRIBUTES, **{
@@ -217,46 +320,54 @@ npm_install = repository_rule(
             (default is 3600 seconds).""",
         ),
         "package_lock_json": attr.label(
+            mandatory = True,
             allow_single_file = True,
         ),
     }),
     implementation = _npm_install_impl,
 )
 """Runs npm install during workspace setup."""
+# Adding the above docstring as `doc` attribute causes a build
+# error since `doc` is not a valid attribute of repository_rule.
+# See https://github.com/bazelbuild/buildtools/issues/471#issuecomment-485278689.
 
 def _yarn_install_impl(repository_ctx):
     """Core implementation of yarn_install."""
 
+    _check_min_bazel_version("yarn_install", repository_ctx)
+
     node = repository_ctx.path(get_node_label(repository_ctx))
     yarn = get_yarn_label(repository_ctx)
 
-    if repository_ctx.attr.yarn_lock:
-        if repository_ctx.attr.exclude_packages:
-            # Copy the file over instead of using a symlink since the lock file
-            # will be modified if there are excluded_packages
-            repository_ctx.template(
-                "yarn.lock",
-                repository_ctx.path(repository_ctx.attr.yarn_lock),
-                {},
-            )
-        else:
-            repository_ctx.symlink(
-                repository_ctx.attr.yarn_lock,
-                repository_ctx.path("yarn.lock"),
-            )
+    # If symlink_node_modules is true then run the package manager
+    # in the package.json folder; otherwise, run it in the root of
+    # the external repository
+    if repository_ctx.attr.symlink_node_modules:
+        root = repository_ctx.path(repository_ctx.attr.package_json).dirname
+    else:
+        root = repository_ctx.path("")
 
-    _add_package_json(repository_ctx)
-    _add_data_dependencies(repository_ctx)
+    if not repository_ctx.attr.symlink_node_modules:
+        repository_ctx.symlink(
+            repository_ctx.attr.yarn_lock,
+            repository_ctx.path("yarn.lock"),
+        )
+        _add_package_json(repository_ctx)
+        _add_data_dependencies(repository_ctx)
+
     _add_scripts(repository_ctx)
 
-    result = repository_ctx.execute([node, "process_package_json.js", ",".join(repository_ctx.attr.exclude_packages)])
+    result = repository_ctx.execute(
+        [node, "pre_process_package_json.js", repository_ctx.path(repository_ctx.attr.package_json), "yarn"],
+        quiet = repository_ctx.attr.quiet,
+    )
     if result.return_code:
-        fail("node failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
+        fail("pre_process_package_json.js failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
 
     args = [
         repository_ctx.path(yarn),
         "--cwd",
-        repository_ctx.path(""),
+        root,
         "--network-timeout",
         str(repository_ctx.attr.network_timeout * 1000),  # in ms
     ]
@@ -280,11 +391,13 @@ def _yarn_install_impl(repository_ctx):
         timeout = repository_ctx.attr.timeout,
         quiet = repository_ctx.attr.quiet,
     )
-
     if result.return_code:
         fail("yarn_install failed: %s (%s)" % (result.stdout, result.stderr))
 
-    _create_build_file(repository_ctx, node, repository_ctx.attr.yarn_lock)
+    if repository_ctx.attr.symlink_node_modules:
+        _symlink_node_modules(repository_ctx)
+
+    _create_build_files(repository_ctx, "yarn_install", node, repository_ctx.attr.yarn_lock)
 
 yarn_install = repository_rule(
     attrs = dict(COMMON_ATTRIBUTES, **{
@@ -315,3 +428,6 @@ yarn_install = repository_rule(
     implementation = _yarn_install_impl,
 )
 """Runs yarn install during workspace setup."""
+# Adding the above docstring as `doc` attribute causes a build
+# error since `doc` is not a valid attribute of repository_rule.
+# See https://github.com/bazelbuild/buildtools/issues/471#issuecomment-485278689.

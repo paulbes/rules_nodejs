@@ -9,12 +9,17 @@ to the `deps` of one of their targets.
 load("//internal/common:sources_aspect.bzl", "sources_aspect")
 
 # Takes a depset of files and returns a corresponding list of file paths without any files
-# that aren't part of the specified package path.
-def _filter_out_external_files(files, package_path):
+# that aren't part of the specified package path. Also include files from external repositories
+# that explicitly specified in the vendor_external list.
+def _filter_out_external_files(ctx, files, package_path):
     result = []
     for file in files:
         if file.short_path.startswith(package_path):
             result.append(file.path)
+        else:
+            for v in ctx.attr.vendor_external:
+                if file.short_path.startswith("../%s/" % v):
+                    result.append(file.path)
     return result
 
 def create_package(ctx, deps_sources, nested_packages):
@@ -38,8 +43,10 @@ def create_package(ctx, deps_sources, nested_packages):
     package_path = ctx.label.package
 
     # List of dependency sources which are local to the package that defines the current
-    # target. We only want to package deps files which are inside of the current package.
-    local_deps_sources = _filter_out_external_files(deps_sources, package_path)
+    # target. Also include files from external repositories that explicitly specified in
+    # the vendor_external list. We only want to package deps files which are inside of the
+    # current package unless explicitely specified.
+    filtered_deps_sources = _filter_out_external_files(ctx, deps_sources, package_path)
 
     args = ctx.actions.args()
     args.use_param_file("%s", use_always = True)
@@ -48,13 +55,18 @@ def create_package(ctx, deps_sources, nested_packages):
     args.add_joined([s.path for s in ctx.files.srcs], join_with = ",", omit_if_empty = False)
     args.add(ctx.bin_dir.path)
     args.add(ctx.genfiles_dir.path)
-    args.add_joined(local_deps_sources, join_with = ",", omit_if_empty = False)
+    args.add_joined(filtered_deps_sources, join_with = ",", omit_if_empty = False)
     args.add_joined([p.path for p in nested_packages], join_with = ",", omit_if_empty = False)
     args.add(ctx.attr.replacements)
     args.add_all([ctx.outputs.pack.path, ctx.outputs.publish.path])
     args.add(ctx.attr.replace_with_version)
     args.add(ctx.version_file.path if ctx.version_file else "")
-    args.add_joined(ctx.attr.vendor_external, join_with = ",")
+    args.add_joined(ctx.attr.vendor_external, join_with = ",", omit_if_empty = False)
+    args.add("1" if ctx.attr.rename_build_files else "0")
+
+    # require.resolve expects the path to start with the workspace name and not "external"
+    run_npm_template_path = ctx.file._run_npm_template.path[len("external") + 1:] if ctx.file._run_npm_template.path.startswith("external") else ctx.file._run_npm_template.path
+    args.add(run_npm_template_path)
 
     inputs = ctx.files.srcs + deps_sources + nested_packages + [ctx.file._run_npm_template]
 
@@ -66,6 +78,7 @@ def create_package(ctx, deps_sources, nested_packages):
         inputs.append(ctx.version_file)
 
     ctx.actions.run(
+        progress_message = "Assembling npm package %s" % package_dir.short_path,
         executable = ctx.executable._packager,
         inputs = inputs,
         outputs = [package_dir, ctx.outputs.pack, ctx.outputs.publish],
@@ -88,9 +101,14 @@ def _npm_package(ctx):
             deps_sources,
             # Collect whatever is in the "data"
             dep.data_runfiles.files,
-            # For JavaScript-producing rules, gather up the devmode Node.js sources
-            dep.node_sources,
         ]
+
+        if hasattr(dep, "node_sources"):
+            # For JavaScript-producing rules, gather up the devmode Node.js sources
+            transitive.append(dep.node_sources)
+        else:
+            # For standalone Output File Targets (aspects not invoked on these)
+            transitive.append(dep.files)
 
         # ts_library doesn't include .d.ts outputs in the runfiles
         # see comment in rules_typescript/internal/common/compilation.bzl
@@ -116,6 +134,12 @@ NPM_PACKAGE_ATTRS = {
         doc = """Other npm_package rules whose content is copied into this package.""",
         allow_files = True,
     ),
+    "rename_build_files": attr.bool(
+        doc = """If set BUILD and BUILD.bazel files are prefixed with `_` in the npm package.
+        The default is True since npm packages that contain BUILD files don't work with
+        `yarn_install` and `npm_install` without a post-install step that deletes or renames them.""",
+        default = True,
+    ),
     "replace_with_version": attr.string(
         doc = """If set this value is replaced with the version stamp data.
         See the section on stamping in the README.""",
@@ -126,13 +150,12 @@ NPM_PACKAGE_ATTRS = {
     ),
     "vendor_external": attr.string_list(
         doc = """External workspaces whose contents should be vendored into this workspace.
-        Avoids 'external/foo' path segments in the resulting package.
-        Note: only targets in the workspace root can include files from an external workspace.
-        Targets in nested packages only pick up files from within that package.""",
+        Avoids 'external/foo' path segments in the resulting package.""",
     ),
     "deps": attr.label_list(
         doc = """Other targets which produce files that should be included in the package, such as `rollup_bundle`""",
         aspects = [sources_aspect],
+        allow_files = True,
     ),
     "_packager": attr.label(
         default = Label("//internal/npm_package:packager"),
@@ -213,3 +236,13 @@ $ bazel run :my_package.publish
 
 You can pass arguments to npm by escaping them from Bazel using a double-hyphen `bazel run my_package.publish -- --tag=next`
 """
+# Adding the above docstring as `doc` attribute
+# causes a build error but ONLY on Ubuntu 14.04 on BazelCI.
+# ```
+# File "internal/npm_package/npm_package.bzl", line 221, in <module>
+#     outputs = NPM_PACKAGE_OUTPUTS,
+# TypeError: rule() got an unexpected keyword argument 'doc'
+# ```
+# This error does not occur on any other platform on BazelCI including Ubuntu 16.04.
+# TOOD(gregmagolan): Figure out why and/or file a bug to Bazel
+# See https://github.com/bazelbuild/buildtools/issues/471#issuecomment-485283200

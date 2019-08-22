@@ -85,7 +85,15 @@ def yarn_install(**kwargs):
 # It will be automatically synced via the npm "version" script
 # that is run when running `npm version` during the release
 # process. See `Releasing` section in README.md.
-VERSION = "0.27.8"
+VERSION = "0.36.1"
+
+# Currently supported Bazel version. This version is what he rules here are tested
+# against. It is also the version used when testing nested workspaces with
+# bazel_integration_test. In the future, after an LTS version of Bazel is released
+# we will test against multiple versions.
+# This version should be updated together with the version of the @bazel/bazel
+# package in package.json. This is asserted in //internal:package_json_test.
+BAZEL_VERSION = "0.28.1"
 
 def check_rules_nodejs_version(minimum_version_string):
     """

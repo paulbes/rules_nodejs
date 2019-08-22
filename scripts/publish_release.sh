@@ -4,24 +4,23 @@ set -u -e -o pipefail
 
 # Publishes our npm packages
 # To dry-run:
-#   ./tools/publish_release.sh pack
+#   ./scripts/publish_release.sh pack
 # To verify:
 #   for p in $(ls packages); do if [[ -d packages/$p ]]; then b="@bazel/$p"; echo -ne "\n$b\n-------\n"; npm dist-tag ls $b; fi; done
-
-readonly RULES_NODEJS_DIR=$(cd $(dirname "$0")/..; pwd)
-source "${RULES_NODEJS_DIR}/scripts/packages.sh"
+# Googlers: you should npm login using the go/npm-publish service:
+# $ npm login --registry https://wombat-dressing-room.appspot.com
 
 readonly NPM_COMMAND=${1:-publish}
+readonly BAZEL_BIN=./node_modules/.bin/bazel
 
 # Use a new output_base so we get a clean build
 # Bazel can't know if the git metadata changed
 readonly TMP=$(mktemp -d -t bazel-release.XXXXXXX)
+readonly BAZEL="$BAZEL_BIN --output_base=$TMP"
+readonly NPM_PACKAGE_LABELS=`$BAZEL query --output=label 'kind("npm_package", //packages/...)'`
 
-echo_and_run() { echo "+ $@" ; "$@" ; }
-
-for pkg in ${PACKAGES[@]} ; do (
-    printf "\n\nBuilding & ${NPM_COMMAND}ing package ${pkg} //:npm_package\n"
-    cd packages/$pkg
-    ${RULES_NODEJS_DIR}/scripts/link_deps.sh
-    echo_and_run ../../node_modules/.bin/bazel --output_base=$TMP run  --workspace_status_command=../../scripts/current_version.sh //:npm_package.${NPM_COMMAND}
-) done
+$BAZEL build --config=release $NPM_PACKAGE_LABELS
+# publish one package at a time to make it easier to spot any errors or warnings
+for pkg in $NPM_PACKAGE_LABELS ; do
+  $BAZEL run -- ${pkg}.${NPM_COMMAND} --access public --tag latest --registry https://wombat-dressing-room.appspot.com
+done

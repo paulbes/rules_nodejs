@@ -66,7 +66,7 @@ function runterser(inputFile, outputFile, sourceMapFile) {
     'compress': {
       'pure_getters': true,
       'passes': 3,
-      'global_defs': {'ngDevMode': false},
+      'global_defs': {'ngDevMode': false, 'ngI18nClosureMode': false},
       'keep_fnames': !debug,
       'reduce_funcs': !debug,
       'reduce_vars': !debug,
@@ -100,7 +100,7 @@ function runterser(inputFile, outputFile, sourceMapFile) {
 
   const isWindows = /^win/i.test(process.platform);
   child_process.execFileSync(
-      isWindows ? 'node.cmd' : 'node', args,
+      isWindows ? 'node.exe' : 'node', args,
       {stdio: [process.stdin, process.stdout, process.stderr]});
 }
 

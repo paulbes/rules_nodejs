@@ -19,13 +19,15 @@ See https://docs.bazel.build/versions/master/skylark/repository_rules.html
 """
 
 load("//internal/common:check_bazel_version.bzl", "check_bazel_version")
-load("//internal/common:os_name.bzl", "os_name")
+load("//internal/common:check_version.bzl", "check_version")
+load("//internal/common:os_name.bzl", "OS_ARCH_NAMES", "is_windows_os", "os_name")
 load("//internal/npm_install:npm_install.bzl", "yarn_install")
 load("//third_party/github.com/bazelbuild/bazel-skylib:lib/paths.bzl", "paths")
+load("//toolchains/node:node_toolchain_configure.bzl", "node_toolchain_configure")
 load(":node_labels.bzl", "get_yarn_node_repositories_label")
 
 # Callers that don't specify a particular version will get these.
-DEFAULT_NODE_VERSION = "10.13.0"
+DEFAULT_NODE_VERSION = "10.16.0"
 DEFAULT_YARN_VERSION = "1.13.0"
 
 # Dictionary mapping NodeJS versions to sets of hosts and their correspoding (filename, strip_prefix, sha256) tuples.
@@ -38,6 +40,10 @@ NODE_REPOSITORIES = {
     "10.13.0-darwin_amd64": ("node-v10.13.0-darwin-x64.tar.gz", "node-v10.13.0-darwin-x64", "815a5d18516934a3963ace9f0574f7d41f0c0ce9186a19be3d89e039e57598c5"),
     "10.13.0-linux_amd64": ("node-v10.13.0-linux-x64.tar.xz", "node-v10.13.0-linux-x64", "0dc6dba645550b66f8f00541a428c29da7c3cde32fb7eda2eb626a9db3bbf08d"),
     "10.13.0-windows_amd64": ("node-v10.13.0-win-x64.zip", "node-v10.13.0-win-x64", "eb09c9e9677f1919ec1ca78623c09b2a718ec5388b72b7662d5c41e5f628a52c"),
+    # 10.16.0
+    "10.16.0-darwin_amd64": ("node-v10.16.0-darwin-x64.tar.gz", "node-v10.16.0-darwin-x64", "6c009df1b724026d84ae9a838c5b382662e30f6c5563a0995532f2bece39fa9c"),
+    "10.16.0-linux_amd64": ("node-v10.16.0-linux-x64.tar.xz", "node-v10.16.0-linux-x64", "1827f5b99084740234de0c506f4dd2202a696ed60f76059696747c34339b9d48"),
+    "10.16.0-windows_amd64": ("node-v10.16.0-win-x64.zip", "node-v10.16.0-win-x64", "aa22cb357f0fb54ccbc06b19b60e37eefea5d7dd9940912675d3ed988bf9a059"),
     # 10.3.0
     "10.3.0-darwin_amd64": ("node-v10.3.0-darwin-x64.tar.gz", "node-v10.3.0-darwin-x64", "0bb5b7e3fe8cccda2abda958d1eb0408f1518a8b0cb58b75ade5d507cd5d6053"),
     "10.3.0-linux_amd64": ("node-v10.3.0-linux-x64.tar.xz", "node-v10.3.0-linux-x64", "eb3c3e2585494699716ad3197c8eedf4003d3f110829b30c5a0dc34414c47423"),
@@ -103,24 +109,6 @@ done
 SCRIPT_DIR="$(cd -P "$( dirname "$SOURCE" )" >/dev/null && pwd)"
 """
 
-# def _write_node_modules_impl(repository_ctx):
-# WORKAROUND for https://github.com/bazelbuild/bazel/issues/374#issuecomment-296217940
-# Bazel does not allow labels to start with `@`, so when installing eg. the `@types/node`
-# module from the @types scoped package, you'll get an error.
-# The workaround is to move the rule up one level, from /node_modules to the project root.
-# For now, users must instead write their own /BUILD file on setup.
-
-# repository_ctx.symlink(project_dir.get_child("node_modules"), "node_modules")
-# add a BUILD file inside the user's node_modules project folder
-# repository_ctx.file("installed/BUILD", """
-#   filegroup(name = "node_modules", srcs = glob(["node_modules/**/*"]), visibility = ["//visibility:public"])
-# """)
-
-# _write_node_modules = repository_rule(
-#     _write_node_modules_impl,
-#     attrs = { "package_json": attr.label() },
-# )
-
 def _download_node(repository_ctx):
     """Used to download a NodeJS runtime package.
 
@@ -129,8 +117,10 @@ def _download_node(repository_ctx):
     """
     if repository_ctx.attr.vendored_node:
         return
-
-    host = os_name(repository_ctx)
+    if repository_ctx.name == "nodejs":
+        host = os_name(repository_ctx)
+    else:
+        host = repository_ctx.name.split("nodejs_", 1)[1]
     node_version = repository_ctx.attr.node_version
     node_repositories = repository_ctx.attr.node_repositories
     node_urls = repository_ctx.attr.node_urls
@@ -187,7 +177,9 @@ def _prepare_node(repository_ctx):
     Args:
       repository_ctx: The repository rule context
     """
-    is_windows = os_name(repository_ctx).find("windows") != -1
+
+    # TODO: Maybe we want to encode the OS as a specific attribute rather than do it based on naming?
+    is_windows = "_windows_" in repository_ctx.attr.name
     if repository_ctx.attr.vendored_node:
         node_exec = "/".join([f for f in [
             "../../..",
@@ -196,16 +188,23 @@ def _prepare_node(repository_ctx):
             repository_ctx.attr.vendored_node.name,
             "bin/node" if not is_windows else "node.exe",
         ] if f])
+        node_exec_label = "@%s//%s:%s/%s" % (
+            repository_ctx.attr.vendored_node.workspace_name,
+            repository_ctx.attr.vendored_node.package,
+            repository_ctx.attr.vendored_node.name,
+            "bin/node" if not is_windows else "node.exe",
+        )
         npm_script = "/".join([f for f in [
             "../../..",
             repository_ctx.attr.vendored_node.workspace_root,
             repository_ctx.attr.vendored_node.package,
             repository_ctx.attr.vendored_node.name,
-            "bin/npm" if not is_windows else "node_modules/npm/bin/npm-cli.js",
+            "lib/node_modules/npm/bin/npm-cli.js" if not is_windows else "node_modules/npm/bin/npm-cli.js",
         ] if f])
     else:
         node_exec = "{}/bin/node".format(NODE_DIR) if not is_windows else "{}/node.exe".format(NODE_DIR)
-        npm_script = "{}/bin/npm".format(NODE_DIR) if not is_windows else "{}/node_modules/npm/bin/npm-cli.js".format(NODE_DIR)
+        npm_script = "{}/lib/node_modules/npm/bin/npm-cli.js".format(NODE_DIR) if not is_windows else "{}/node_modules/npm/bin/npm-cli.js".format(NODE_DIR)
+        node_exec_label = node_exec
     if repository_ctx.attr.vendored_yarn:
         yarn_script = "/".join([f for f in [
             "../../..",
@@ -227,6 +226,20 @@ def _prepare_node(repository_ctx):
     if not repository_ctx.attr.preserve_symlinks:
         print("\nWARNING: The preserve_symlinks option is deprecated and will go away in the future.\n")
 
+    if repository_ctx.attr.preserve_symlinks:
+        # --preserve-symlinks-main flag added in node 10.2.0
+        # See https://nodejs.org/api/cli.html#cli_preserve_symlinks_main
+        preserve_symlinks_main_support = check_version(repository_ctx.attr.node_version, "10.2.0")
+        if preserve_symlinks_main_support:
+            node_args = "--preserve-symlinks --preserve-symlinks-main"
+            node_repo_args = "\"--node_options=--preserve-symlinks --node_options=--preserve-symlinks-main\""
+        else:
+            node_args = "--preserve-symlinks"
+            node_repo_args = "--node_options=--preserve-symlinks"
+    else:
+        node_args = ""
+        node_repo_args = ""
+
     # The entry points for node for osx/linux and windows
     if not is_windows:
         # Sets PATH and runs the application
@@ -236,10 +249,11 @@ def _prepare_node(repository_ctx):
 set -e
 {get_script_dir}
 export PATH="$SCRIPT_DIR":$PATH
-exec "$SCRIPT_DIR/{node}" "$@"
+exec "$SCRIPT_DIR/{node}" {args} "$@"
 """.format(
             get_script_dir = GET_SCRIPT_DIR,
             node = node_exec_relative,
+            args = node_args,
         ))
     else:
         # Sets PATH for node, npm & yarn and run user script
@@ -247,16 +261,16 @@ exec "$SCRIPT_DIR/{node}" "$@"
 @echo off
 SET SCRIPT_DIR=%~dp0
 SET PATH=%SCRIPT_DIR%;%PATH%
-CALL "%SCRIPT_DIR%\\{node}" %*
-""".format(node = node_exec_relative))
+CALL "%SCRIPT_DIR%\\{node}" {args} %*
+""".format(node = node_exec_relative, args = node_args))
 
     # Shell script to set repository arguments for node used by nodejs_binary & nodejs_test launcher
-    repository_ctx.file("bin/node_args.sh", content = """#!/usr/bin/env bash
+    repository_ctx.file("bin/node_repo_args.sh", content = """#!/usr/bin/env bash
 # Immediately exit if any command fails.
 set -e
 # Generated by node_repositories.bzl
 export NODE_REPOSITORY_ARGS={}
-""".format("--node_options=--preserve-symlinks" if repository_ctx.attr.preserve_symlinks else ""), executable = True)
+""".format(node_repo_args), executable = True)
 
     # The entry points for npm for osx/linux and windows
     # Runs npm using appropriate node entry point
@@ -405,22 +419,30 @@ if %errorlevel% neq 0 exit /b %errorlevel%
             for package_json in repository_ctx.attr.package_json
         ]), executable = True)
 
-    # Generate build file for this repository - exposes the node runtime and utilities generated above.
-    repository_ctx.template(
-        "generate_build_file.js",
-        repository_ctx.path(Label("//internal/node:generate_build_file.js")),
-        {
-            "TEMPLATED_is_windows": "true" if is_windows else "false",
-            "TEMPLATED_node_actual": node_entry,
-            "TEMPLATED_node_dir": NODE_DIR,
-            "TEMPLATED_npm_actual": npm_node_repositories_entry,
-            "TEMPLATED_yarn_actual": yarn_node_repositories_entry,
-            "TEMPLATED_yarn_dir": YARN_DIR,
-        },
-    )
-    result = repository_ctx.execute([node_entry, "generate_build_file.js"])
-    if result.return_code:
-        fail("node failed: \nSTDOUT:\n%s\nSTDERR:\n%s" % (result.stdout, result.stderr))
+    # Base BUILD file for this repository
+    repository_ctx.file("BUILD.bazel", content = """# Generated by node_repositories.bzl
+package(default_visibility = ["//visibility:public"])
+exports_files([
+  "run_npm.sh.template",
+  "bin/node_repo_args.sh",{exported_node_bin}
+  "bin/node{entry_ext}",
+  "bin/npm{entry_ext}",
+  "bin/npm_node_repositories{entry_ext}",
+  "bin/yarn{entry_ext}",
+  "bin/yarn_node_repositories{entry_ext}",
+  ])
+alias(name = "node_bin", actual = "{node_bin_actual}")
+alias(name = "node", actual = "{node_actual}")
+alias(name = "npm", actual = "{npm_actual}")
+alias(name = "yarn", actual = "{yarn_actual}")
+""".format(
+        entry_ext = ".cmd" if is_windows else "",
+        exported_node_bin = "" if repository_ctx.attr.vendored_node else ("\n  \"%s\"," % node_exec_label),
+        node_bin_actual = node_exec_label,
+        node_actual = node_entry,
+        npm_actual = npm_node_repositories_entry,
+        yarn_actual = yarn_node_repositories_entry,
+    ))
 
 def _nodejs_repo_impl(repository_ctx):
     _download_node(repository_ctx)
@@ -454,6 +476,32 @@ alias(name = "yarn", actual = "{yarn}")
 _yarn_repo = repository_rule(
     _yarn_repo_impl,
     attrs = {"package_json": attr.label_list()},
+)
+
+def _nodejs_host_os_alias_impl(repository_ctx):
+    host_os = os_name(repository_ctx)
+    node_repository = "@nodejs_%s" % host_os
+    is_windows_host = is_windows_os(repository_ctx)
+    file_ending = ".cmd" if is_windows_host else ""
+    actual_node_bin = "bin/nodejs/node.exe" if is_windows_host else "bin/nodejs/bin/node"
+    repository_ctx.template(
+        "BUILD.bazel",
+        Label("@build_bazel_rules_nodejs//internal/node:BUILD.nodejs_host_os_alias.tpl"),
+        substitutions = {
+            "TEMPLATE__npm_node_repositories": "%s//:bin/npm_node_repositories%s" % (node_repository, file_ending),
+            "TEMPLATE__yarn_node_repositories": "%s//:bin/yarn_node_repositories%s" % (node_repository, file_ending),
+            "TEMPLATE_actual_node_bin": "%s//:%s" % (node_repository, actual_node_bin),
+            "TEMPLATE_node_repo_args": "%s//:bin/node_repo_args.sh" % node_repository,
+            "TEMPLATE_npm": "%s//:bin/npm%s" % (node_repository, file_ending),
+            "TEMPLATE_run_npm": "%s//:run_npm.sh.template" % node_repository,
+            "TEMPLATE_wrapped_node_bin": "%s//:bin/node%s" % (node_repository, file_ending),
+            "TEMPLATE_yarn": "%s//:bin/yarn%s" % (node_repository, file_ending),
+        },
+        executable = False,
+    )
+
+_nodejs_repo_host_os_alias = repository_rule(
+    _nodejs_host_os_alias_impl,
 )
 
 def node_repositories(
@@ -513,23 +561,18 @@ def node_repositories(
                     when you manually run the package manager, e.g. with
                     `bazel run @nodejs//:yarn` or `bazel run @nodejs//:npm install`.
                     If you use bazel-managed dependencies, you can omit this attribute.
-
-      node_version: optional; the specific version of NodeJS to install.
-
+      node_version: optional; the specific version of NodeJS to install or, if
+        vendored_node is specified, the vendored version of node.
       yarn_version: optional; the specific version of Yarn to install.
-
       vendored_node: optional; the local path to a pre-installed NodeJS runtime.
-
+        If set then also set node_version to the version that of node that is vendored.
+        Bazel will automatically turn on features such as --preserve-symlinks-main if they
+        are supported by the node version being used.
       vendored_yarn: optional; the local path to a pre-installed yarn tool.
-
       node_repositories: optional; custom list of node repositories to use.
-
       yarn_repositories: optional; custom list of yarn repositories to use.
-
       node_urls: optional; custom list of URLs to use to download NodeJS.
-
       yarn_urls: optional; custom list of URLs to use to download Yarn.
-
       preserve_symlinks: Turn on --node_options=--preserve-symlinks for nodejs_binary and nodejs_test rules.
         The default for this is currently True but the options is deprecated and will be removed in the future.
         When this option is turned on, node will preserve the symlinked path for resolves instead of the default
@@ -542,21 +585,42 @@ def node_repositories(
     # 0.14.0: @bazel_tools//tools/bash/runfiles is required for nodejs
     # 0.17.1: allow @ in package names is required for fine grained deps
     # 0.21.0: repository_ctx.report_progress API
-    check_bazel_version("0.21.0")
+    check_bazel_version(
+        message = """
+    A minimum Bazel version of 0.21.0 is required to use build_bazel_rules_nodejs.
+    """,
+        minimum_bazel_version = "0.21.0",
+    )
 
+    # This needs to be setup so toolchains can access nodejs for all different versions
+    for os_arch_name in OS_ARCH_NAMES:
+        os_name = "_".join(os_arch_name)
+        node_repository_name = "nodejs_%s" % os_name
+        _maybe(
+            _nodejs_repo,
+            name = node_repository_name,
+            package_json = package_json,
+            node_version = node_version,
+            yarn_version = yarn_version,
+            vendored_node = vendored_node,
+            vendored_yarn = vendored_yarn,
+            node_repositories = node_repositories,
+            yarn_repositories = yarn_repositories,
+            node_urls = node_urls,
+            yarn_urls = yarn_urls,
+            preserve_symlinks = preserve_symlinks,
+        )
+        native.register_toolchains("@build_bazel_rules_nodejs//toolchains/node:node_%s_toolchain" % os_arch_name[0])
+        node_toolchain_configure(
+            name = "%s_config" % node_repository_name,
+            target_tool = "@%s//:node_bin" % node_repository_name,
+        )
+
+    # This "nodejs" repo is just for convinience so one does not have to target @nodejs_<os_name>//...
+    # All it does is create aliases to the @nodejs_<host_os>_<host_arch> repository
     _maybe(
-        _nodejs_repo,
+        _nodejs_repo_host_os_alias,
         name = "nodejs",
-        package_json = package_json,
-        node_version = node_version,
-        yarn_version = yarn_version,
-        vendored_node = vendored_node,
-        vendored_yarn = vendored_yarn,
-        node_repositories = node_repositories,
-        yarn_repositories = yarn_repositories,
-        node_urls = node_urls,
-        yarn_urls = yarn_urls,
-        preserve_symlinks = preserve_symlinks,
     )
 
     _maybe(
@@ -567,19 +631,14 @@ def node_repositories(
 
     _maybe(
         yarn_install,
-        name = "build_bazel_rules_nodejs_npm_install_deps",
-        package_json = "@build_bazel_rules_nodejs//internal/npm_install:package.json",
-        yarn_lock = "@build_bazel_rules_nodejs//internal/npm_install:yarn.lock",
-        # Just here as a smoke test for this attribute
-        prod_only = True,
-    )
-
-    _maybe(
-        yarn_install,
         name = "build_bazel_rules_nodejs_rollup_deps",
         package_json = "@build_bazel_rules_nodejs//internal/rollup:package.json",
         yarn_lock = "@build_bazel_rules_nodejs//internal/rollup:yarn.lock",
         data = ["@build_bazel_rules_nodejs//internal/rollup:postinstall-patches.js"],
+        # Do not symlink node_modules as when used in downstream repos we should not create
+        # node_modules folders in the @build_bazel_rules_nodejs external repository. This is
+        # not supported by managed_directories.
+        symlink_node_modules = False,
     )
 
     _maybe(
@@ -587,6 +646,10 @@ def node_repositories(
         name = "history-server_runtime_deps",
         package_json = "@build_bazel_rules_nodejs//internal/history-server:package.json",
         yarn_lock = "@build_bazel_rules_nodejs//internal/history-server:yarn.lock",
+        # Do not symlink node_modules as when used in downstream repos we should not create
+        # node_modules folders in the @build_bazel_rules_nodejs external repository. This is
+        # not supported by managed_directories.
+        symlink_node_modules = False,
     )
 
     _maybe(
@@ -594,13 +657,10 @@ def node_repositories(
         name = "http-server_runtime_deps",
         package_json = "@build_bazel_rules_nodejs//internal/http-server:package.json",
         yarn_lock = "@build_bazel_rules_nodejs//internal/http-server:yarn.lock",
-    )
-
-    _maybe(
-        yarn_install,
-        name = "build_bazel_rules_nodejs_web_package_deps",
-        package_json = "@build_bazel_rules_nodejs//internal/web_package:package.json",
-        yarn_lock = "@build_bazel_rules_nodejs//internal/web_package:yarn.lock",
+        # Do not symlink node_modules as when used in downstream repos we should not create
+        # node_modules folders in the @build_bazel_rules_nodejs external repository. This is
+        # not supported by managed_directories.
+        symlink_node_modules = False,
     )
 
 def _maybe(repo_rule, name, **kwargs):

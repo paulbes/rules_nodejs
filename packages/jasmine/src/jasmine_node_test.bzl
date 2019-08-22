@@ -28,21 +28,35 @@ def jasmine_node_test(
         deps = [],
         expected_exit_code = 0,
         tags = [],
-        jasmine = Label("@npm//@bazel/jasmine"),
+        config_file = None,
+        coverage = False,
+        jasmine = "@npm//@bazel/jasmine",
+        jasmine_entry_point = "@npm//:node_modules/@bazel/jasmine/jasmine_runner.js",
         **kwargs):
     """Runs tests in NodeJS using the Jasmine test runner.
 
     To debug the test, see debugging notes in `nodejs_test`.
 
     Args:
-      name: name of the resulting label
+      name: Name of the resulting label
       srcs: JavaScript source files containing Jasmine specs
       data: Runtime dependencies which will be loaded while the test executes
       deps: Other targets which produce JavaScript, such as ts_library
-      expected_exit_code: The expected exit code for the test. Defaults to 0.
-      tags: bazel tags applied to test
-      jasmine: a label providing the jasmine dependency
-      **kwargs: remaining arguments are passed to the test rule
+      expected_exit_code: The expected exit code for the test.
+      tags: Bazel tags applied to test
+      config_file: (experimental) label of a file containing Jasmine JSON config.
+
+        Note that not all configuration options are honored, and
+        we expect some strange feature interations.
+        For example, the filter for which files are instrumented for
+        code coverage doesn't understand the spec_files setting in the config.
+
+        See https://jasmine.github.io/setup/nodejs.html#configuration
+
+      coverage: Enables code coverage collection and reporting.
+      jasmine: A label providing the `@bazel/jasmine` npm dependency.
+      jasmine_entry_point: A label providing the `@bazel/jasmine` entry point.
+      **kwargs: Remaining arguments are passed to the test rule
     """
     devmode_js_sources(
         name = "%s_devmode_srcs" % name,
@@ -51,16 +65,33 @@ def jasmine_node_test(
         tags = tags,
     )
 
-    all_data = data + srcs + deps + [jasmine]
+    all_data = data + srcs + deps + [Label(jasmine)]
+
     all_data += [":%s_devmode_srcs.MF" % name]
     all_data += [Label("@bazel_tools//tools/bash/runfiles")]
-    entry_point = "@bazel/jasmine/src/jasmine_runner.js"
+
+    # If the target specified templated_args, pass it through.
+    templated_args = kwargs.pop("templated_args", [])
+    templated_args.append("$(location :%s_devmode_srcs.MF)" % name)
+
+    if coverage:
+        templated_args.append("--coverage")
+    else:
+        templated_args.append("--nocoverage")
+
+    if config_file:
+        # Calculate a label relative to the user's BUILD file
+        pkg = Label("%s//%s:__pkg__" % (native.repository_name(), native.package_name()))
+        all_data.append(pkg.relative(config_file))
+        templated_args.append("$(location %s)" % config_file)
+    else:
+        templated_args.append("--noconfig")
 
     nodejs_test(
         name = name,
         data = all_data,
-        entry_point = entry_point,
-        templated_args = ["$(location :%s_devmode_srcs.MF)" % name],
+        entry_point = jasmine_entry_point,
+        templated_args = templated_args,
         testonly = 1,
         expected_exit_code = expected_exit_code,
         tags = tags,

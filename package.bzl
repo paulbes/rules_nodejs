@@ -12,19 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dependency-related rules defining our version and dependency versions.
+"""Dependency-related rules defining our dependency versions.
 
 Fulfills similar role as the package.json file.
 """
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-def rules_nodejs_dependencies():
-    print("""DEPRECATION WARNING:
-    rules_nodejs_dependencies is no longer needed, and will be removed in a future release.
-    Simply remove any calls to this function and the corresponding call to
-      load("@build_bazel_rules_nodejs//:package.bzl", "rules_nodejs_dependencies")
-    """)
 
 def rules_nodejs_dev_dependencies():
     """
@@ -37,54 +30,71 @@ def rules_nodejs_dev_dependencies():
     # Dependencies for generating documentation
     http_archive(
         name = "io_bazel_rules_sass",
-        url = "https://github.com/bazelbuild/rules_sass/archive/8ccf4f1c351928b55d5dddf3672e3667f6978d60.zip",  # 2018-11-23
-        strip_prefix = "rules_sass-8ccf4f1c351928b55d5dddf3672e3667f6978d60",
-        sha256 = "894d7928df8da85e263d743c8434d4c10ab0a3f0708fed0d53394e688e3faf70",
+        sha256 = "4f05239080175a3f4efa8982d2b7775892d656bb47e8cf56914d5f9441fb5ea6",
+        url = "https://github.com/bazelbuild/rules_sass/archive/86ca977cf2a8ed481859f83a286e164d07335116.zip",
+        strip_prefix = "rules_sass-86ca977cf2a8ed481859f83a286e164d07335116",
     )
 
-    # Needed for stardoc
-    # TODO(gregmagolan): switch to https://github.com/bazelbuild/bazel/archive/0.23.x.tar.gz when
-    # the commit pulled here makes it into a release
+    # Needed for @com_github_bazelbuild_buildtools which is used by ts_auto_deps
     http_archive(
         name = "io_bazel",
-        url = "https://github.com/bazelbuild/bazel/archive/1488f91fec238adacbd0517fcee15d8ec0599b8d.zip",
-        sha256 = "f0dba27ac4e5145de7fc727229fe87f01399a1ef3c5225dc9b8c7e77156d91af",
-        strip_prefix = "bazel-1488f91fec238adacbd0517fcee15d8ec0599b8d",
+        url = "https://github.com/bazelbuild/bazel/archive/0.28.1.tar.gz",
+        strip_prefix = "bazel-0.28.1",
+        sha256 = "a3d6a8ba4c6dce86d3b3387a23b04cbdf4c435a58120bd9842588d3845fe689c",
     )
 
+    # Needed for com_google_protobuf
     http_archive(
-        name = "com_google_protobuf",
-        sha256 = "9510dd2afc29e7245e9e884336f848c8a6600a14ae726adb6befdb4f786f0be2",
-        strip_prefix = "protobuf-3.6.1.3",
-        type = "zip",
-        # v3.6.1.3 as of 2019-01-15
-        urls = ["https://github.com/protocolbuffers/protobuf/archive/v3.6.1.3.zip"],
+        name = "zlib",
+        build_file = "@com_google_protobuf//:third_party/zlib.BUILD",
+        sha256 = "c3e5e9fdd5004dcb542feda5ee4f0ff0744628baf8ed2dd5d66f8ca1197cb1a1",
+        strip_prefix = "zlib-1.2.11",
+        urls = ["https://zlib.net/zlib-1.2.11.tar.gz"],
     )
 
     http_archive(
         name = "io_bazel_skydoc",
-        sha256 = "75fd965a71ca1f0d0406d0d0fb0964d24090146a853f58b432761a1a6c6b47b9",
-        strip_prefix = "skydoc-82fdbfe797c6591d8732df0c0389a2b1c3e50992",
-        url = "https://github.com/bazelbuild/skydoc/archive/82fdbfe797c6591d8732df0c0389a2b1c3e50992.zip",  # 2018-12-12
+        sha256 = "fdc34621839104b57363a258eab9d821b02ff7837923cfe7fb6fd67182780829",
+        strip_prefix = "skydoc-41c28e43dffbae39c52dd4b91932d1209e5a8893",
+        url = "https://github.com/bazelbuild/skydoc/archive/41c28e43dffbae39c52dd4b91932d1209e5a8893.tar.gz",
     )
 
+    # bazel-skylib master 2019.05.03 to get support for https://github.com/bazelbuild/bazel-skylib/pull/140
     http_archive(
         name = "bazel_skylib",
-        url = "https://github.com/bazelbuild/bazel-skylib/archive/0.6.0.zip",
-        strip_prefix = "bazel-skylib-0.6.0",
-        sha256 = "54ee22e5b9f0dd2b42eb8a6c1878dee592cfe8eb33223a7dbbc583a383f6ee1a",
+        sha256 = "afbe4d9d033c007940acd24bb9becf1580a0280ae0b2ebbb5a7cb12912d2c115",
+        strip_prefix = "bazel-skylib-ffad33e9bfc60bdfa98292ca655a4e7035792046",
+        urls = ["https://github.com/bazelbuild/bazel-skylib/archive/ffad33e9bfc60bdfa98292ca655a4e7035792046.tar.gz"],
+    )
+
+    # Gross dep that leaked out of stardoc, see
+    # https://github.com/bazelbuild/skydoc/commit/9283f6a44811423756ab898e98ce410029c12f7b#commitcomment-34488585
+    http_archive(
+        name = "rules_java",
+        sha256 = "bc81f1ba47ef5cc68ad32225c3d0e70b8c6f6077663835438da8d5733f917598",
+        strip_prefix = "rules_java-7cf3cefd652008d0a64a419c34c13bdca6c8f178",
+        urls = [
+            "https://mirror.bazel.build/github.com/bazelbuild/rules_java/archive/7cf3cefd652008d0a64a419c34c13bdca6c8f178.zip",
+            "https://github.com/bazelbuild/rules_java/archive/7cf3cefd652008d0a64a419c34c13bdca6c8f178.zip",
+        ],
     )
 
     # Needed for Remote Build Execution
     # See https://releases.bazel.build/bazel-toolchains.html
     http_archive(
         name = "bazel_toolchains",
-        sha256 = "4b1468b254a572dbe134cc1fd7c6eab1618a72acd339749ea343bd8f55c3b7eb",
-        strip_prefix = "bazel-toolchains-d665ccfa3e9c90fa789671bf4ef5f7c19c5715c4",
+        sha256 = "55abc3a76e3718e5835e621ee5ba4cb915b325688bbf8b32f3288f6a5c36d93a",
+        strip_prefix = "bazel-toolchains-be10bee",
         urls = [
-            "https://mirror.bazel.build/github.com/bazelbuild/bazel-toolchains/archive/d665ccfa3e9c90fa789671bf4ef5f7c19c5715c4.tar.gz",
-            "https://github.com/bazelbuild/bazel-toolchains/archive/d665ccfa3e9c90fa789671bf4ef5f7c19c5715c4.tar.gz",
+            "https://github.com/bazelbuild/bazel-toolchains/archive/be10bee.tar.gz",
         ],
+    )
+
+    http_archive(
+        name = "build_bazel_integration_testing",
+        url = "https://github.com/bazelbuild/bazel-integration-testing/archive/922d2b04bfb9721ab14ff6d26d4a8a6ab847aa07.zip",
+        strip_prefix = "bazel-integration-testing-922d2b04bfb9721ab14ff6d26d4a8a6ab847aa07",
+        sha256 = "490554b98da4ce6e3e1e074e01b81e8440b760d4f086fccf50085a25528bf5cd",
     )
 
 def _maybe(repo_rule, name, **kwargs):

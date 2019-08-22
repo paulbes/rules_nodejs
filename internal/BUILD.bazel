@@ -12,10 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("//:defs.bzl", "BAZEL_VERSION", "nodejs_test")
+
 package(default_visibility = ["//visibility:public"])
 
 filegroup(
     name = "package_contents",
     srcs = glob(["*"]),
     visibility = ["//:__pkg__"],
+)
+
+nodejs_test(
+    name = "package_json_test",
+    data = [
+        "check_package_json.js",
+        "//:package.json",
+    ],
+    entry_point = ":check_package_json.js",
+    templated_args = [BAZEL_VERSION],
 )

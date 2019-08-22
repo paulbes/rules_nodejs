@@ -13,7 +13,7 @@
 # limitations under the License.
 
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
-load("//:defs.bzl", "jasmine_node_test", "nodejs_binary")
+load("//:defs.bzl", "nodejs_binary")
 
 licenses(["notice"])  # Apache 2.0
 
@@ -38,7 +38,7 @@ nodejs_binary(
     # Allow --define=ROLLUP_BUNDLE_FIXED_CHUNK_NAMES=1 to be passed as
     # process.env so we can give predictable chunk names in CI
     configuration_env_vars = ["ROLLUP_BUNDLE_FIXED_CHUNK_NAMES"],
-    entry_point = "build_bazel_rules_nodejs_rollup_deps/node_modules/rollup/bin/rollup",
+    entry_point = "@build_bazel_rules_nodejs_rollup_deps//:node_modules/rollup/bin/rollup",
     install_source_map_support = False,
     node_modules = "@build_bazel_rules_nodejs_rollup_deps//:node_modules",
     visibility = ["//visibility:public"],
@@ -46,7 +46,7 @@ nodejs_binary(
 
 nodejs_binary(
     name = "tsc",
-    entry_point = "build_bazel_rules_nodejs_rollup_deps/node_modules/typescript/bin/tsc",
+    entry_point = "@build_bazel_rules_nodejs_rollup_deps//:node_modules/typescript/bin/tsc",
     install_source_map_support = False,
     node_modules = "@build_bazel_rules_nodejs_rollup_deps//:node_modules",
     visibility = ["//visibility:public"],
@@ -54,7 +54,7 @@ nodejs_binary(
 
 nodejs_binary(
     name = "terser",
-    entry_point = "build_bazel_rules_nodejs_rollup_deps/node_modules/terser/bin/uglifyjs",
+    entry_point = "@build_bazel_rules_nodejs_rollup_deps//:node_modules/terser/bin/uglifyjs",
     install_source_map_support = False,
     node_modules = "@build_bazel_rules_nodejs_rollup_deps//:node_modules",
     visibility = ["//visibility:public"],
@@ -63,7 +63,7 @@ nodejs_binary(
 nodejs_binary(
     name = "terser-wrapped",
     data = [":terser-wrapped.js"],
-    entry_point = "build_bazel_rules_nodejs/internal/rollup/terser-wrapped.js",
+    entry_point = ":terser-wrapped.js",
     install_source_map_support = False,
     node_modules = "@build_bazel_rules_nodejs_rollup_deps//:node_modules",
     visibility = ["//visibility:public"],
@@ -72,7 +72,7 @@ nodejs_binary(
 nodejs_binary(
     name = "tsc-directory",
     data = [":tsc-directory.js"],
-    entry_point = "build_bazel_rules_nodejs/internal/rollup/tsc-directory.js",
+    entry_point = ":tsc-directory.js",
     install_source_map_support = False,
     node_modules = "@build_bazel_rules_nodejs_rollup_deps//:node_modules",
     visibility = ["//visibility:public"],
@@ -80,11 +80,16 @@ nodejs_binary(
 
 nodejs_binary(
     name = "source-map-explorer",
-    entry_point = "build_bazel_rules_nodejs_rollup_deps/node_modules/source-map-explorer",
+    entry_point = "@build_bazel_rules_nodejs_rollup_deps//:node_modules/source-map-explorer/index.js",
     install_source_map_support = False,
     node_modules = "@build_bazel_rules_nodejs_rollup_deps//:node_modules",
     visibility = ["//visibility:public"],
 )
+
+# BEGIN-INTERNAL
+# buildozer: disable=load-on-top
+# buildozer: disable=out-of-order-load
+load("@npm_bazel_jasmine//:index.from_src.bzl", "jasmine_node_test")
 
 jasmine_node_test(
     name = "test",
@@ -95,15 +100,16 @@ jasmine_node_test(
     ),
     deps = [
         "@npm//is-builtin-module",
-        "@npm//jasmine",
         "@npm//rollup",
         "@npm//rollup-plugin-amd",
         "@npm//rollup-plugin-commonjs",
+        "@npm//rollup-plugin-json",
         "@npm//rollup-plugin-node-resolve",
         "@npm//rollup-plugin-sourcemaps",
     ],
 )
 
+# END-INTERNAL
 filegroup(
     name = "package_contents",
     srcs = glob(
