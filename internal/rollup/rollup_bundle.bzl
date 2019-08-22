@@ -227,7 +227,7 @@ def _run_rollup(ctx, sources, config, output, map_output = None):
 
     ctx.actions.run(
         progress_message = "Bundling JavaScript %s [rollup]" % output.short_path,
-        executable = ctx.executable._rollup,
+        executable = ctx.executable.rollup,
         inputs = depset(direct_inputs, transitive = [sources]),
         outputs = outputs,
         arguments = [args],
